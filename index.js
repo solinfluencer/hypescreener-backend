@@ -31,9 +31,9 @@ async function loadInitialTokens() {
   try {
     console.log("Loading initial tokens from Helius...");
     const response = await fetch(`https://api.helius.xyz/v0/tokens?api-key=${process.env.HELIUS_API_KEY}`);
+    if (!response.ok) throw new Error(`Helius API error: ${response.status}`);
     const tokens = await response.json();
     
-    // Filter for new tokens (less than 12 hours old)
     const newTokens = tokens
       .filter(t => {
         try {
@@ -54,13 +54,10 @@ async function loadInitialTokens() {
     
     console.log(`Found ${newTokens.length} new tokens`);
     
-    // Update token data with DexScreener info
     await Promise.all(newTokens.map(updateTokenData));
     
-    // Store in Redis
     await redis.set("newTokens", rankTokens(newTokens).slice(0, 5));
     
-    // Initialize featured tokens if not exists
     const featuredExists = await redis.exists("featuredTokens");
     if (!featuredExists) {
       await redis.set("featuredTokens", []);
@@ -72,23 +69,16 @@ async function loadInitialTokens() {
 
 async function updateTokenData(token) {
   try {
-    // Get data from DexScreener
     const dexResponse = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token.address}`);
     const dexData = await dexResponse.json();
     const pair = dexData.pairs?.[0] || {};
     
-    // Update token with trading data
     token.name = pair.baseToken?.name || token.name;
     token.marketCap = parseFloat(pair.fdv || 0);
     token.volume = parseFloat(pair.volume?.h24 || 0);
-    
-    // Calculate hype score
     token.hypeScore = calculateHypeScore(token);
-    
-    // Generate mock X mentions based on market cap and volume
     token.xMentions = generateXMentions(token);
     
-    // Store token in Redis
     await redis.hset(`allTokens:${token.address}`, token);
     
     return token;
@@ -99,38 +89,24 @@ async function updateTokenData(token) {
 }
 
 function calculateHypeScore(token) {
-  // Base score between 60-75
   let score = 60 + Math.floor(Math.random() * 15);
-  
-  // Parse age to get hours
   const ageHours = parseInt(token.age);
-  
-  // Newer tokens get a boost
   if (!isNaN(ageHours)) {
     if (ageHours < 3) score += 10;
     if (ageHours < 6) score += 5;
   }
-  
-  // Boost score based on market cap and volume
   const marketCapMillions = token.marketCap / 1000000;
   if (marketCapMillions > 0.1) score += 5;
   if (marketCapMillions > 0.5) score += 5;
-  
   if (token.volume > 5000) score += 5;
   if (token.volume > 20000) score += 5;
-  
-  // Cap at 95
   return Math.min(score, 95);
 }
 
 function generateXMentions(token) {
-  // Base mentions
   const baseMentions = 50 + Math.floor(Math.random() * 200);
-  
-  // More market cap/volume = more social mentions
   const marketCapMultiplier = token.marketCap ? Math.min(token.marketCap / 50000, 5) : 1;
   const volumeMultiplier = token.volume ? Math.min(token.volume / 5000, 5) : 1;
-  
   return Math.floor(baseMentions * (marketCapMultiplier + volumeMultiplier) / 2);
 }
 
@@ -142,13 +118,13 @@ function rankTokens(tokens) {
 const connectToHelius = () => {
   console.log("Connecting to Helius WebSocket...");
   
-  const ws = new WebSocket(`wss://ws.helius.xyz/?api-key=${process.env.HELIUS_API_KEY}`);
+  const ws = new WebSocket(`wss://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`);
   
   ws.on("open", () => {
     console.log("Connected to Helius WebSocket");
     ws.send(JSON.stringify({
       command: "subscribe",
-      accounts: [], // All mints (empty filter)
+      accounts: [],
       types: ["TOKEN_MINT"]
     }));
   });
@@ -160,13 +136,10 @@ const connectToHelius = () => {
       
       const mint = event.data;
       const ageMs = Date.now() - new Date(mint.timestamp).getTime();
-      
-      // Only process tokens less than 12 hours old
       if (ageMs >= 12 * 3600 * 1000) return;
       
       console.log(`New token mint detected: ${mint.name || mint.mint}`);
       
-      // Create token object
       const token = {
         name: mint.name || "Unknown",
         address: mint.mint,
@@ -177,26 +150,15 @@ const connectToHelius = () => {
         xMentions: 0
       };
       
-      // Check if token already exists
       const exists = await redis.hexists(`allTokens:${token.address}`, "address");
       if (exists) return;
       
-      // Update token with trading data
       await updateTokenData(token);
       
-      // Get current new tokens
       let newTokens = await redis.get("newTokens") || [];
-      
-      // Add new token
       newTokens.unshift(token);
-      
-      // Rank and limit to top 5
       newTokens = rankTokens(newTokens).slice(0, 5);
-      
-      // Update Redis
       await redis.set("newTokens", newTokens);
-      
-      // Trigger Pusher event
       pusher.trigger("new-tokens-channel", "new-token-event", token);
     } catch (error) {
       console.error("Error processing WebSocket message:", error);
@@ -205,12 +167,12 @@ const connectToHelius = () => {
   
   ws.on("error", (error) => {
     console.error("Helius WebSocket error:", error);
-    setTimeout(connectToHelius, 5000); // Reconnect after 5 seconds
+    setTimeout(connectToHelius, 5000);
   });
   
   ws.on("close", () => {
     console.log("Helius WebSocket connection closed");
-    setTimeout(connectToHelius, 5000); // Reconnect after 5 seconds
+    setTimeout(connectToHelius, 5000);
   });
 };
 
@@ -238,12 +200,10 @@ app.get("/api/featured-tokens", async (req, res) => {
 app.post("/api/list-token", async (req, res) => {
   try {
     const { name, address } = req.body;
-    
     if (!name || !address) {
       return res.status(400).json({ error: "Name and address are required" });
     }
     
-    // Create token object
     const token = {
       name,
       address,
@@ -255,22 +215,12 @@ app.post("/api/list-token", async (req, res) => {
       sponsored: true
     };
     
-    // Update token with trading data
     await updateTokenData(token);
     
-    // Get current featured tokens
     let featuredTokens = await redis.get("featuredTokens") || [];
-    
-    // Add new token
     featuredTokens.unshift(token);
-    
-    // Limit to top 5
     featuredTokens = featuredTokens.slice(0, 5);
-    
-    // Update Redis
     await redis.set("featuredTokens", featuredTokens);
-    
-    // Trigger Pusher event
     pusher.trigger("featured-tokens-channel", "new-featured-event", token);
     
     res.json({ success: true });
@@ -283,19 +233,15 @@ app.post("/api/list-token", async (req, res) => {
 app.get("/api/search", async (req, res) => {
   try {
     const { q } = req.query;
-    
     if (!q) {
       return res.status(400).json({ error: "Query parameter 'q' is required" });
     }
     
-    // Check if token exists in Redis
     const token = await redis.hgetall(`allTokens:${q}`);
-    
     if (token && token.address) {
       return res.json(token);
     }
     
-    // If not in Redis, try to fetch from DexScreener
     const dexResponse = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${q}`);
     const dexData = await dexResponse.json();
     const pair = dexData.pairs?.[0];
@@ -307,17 +253,13 @@ app.get("/api/search", async (req, res) => {
         age: "N/A",
         marketCap: parseFloat(pair.fdv || 0),
         volume: parseFloat(pair.volume?.h24 || 0),
-        hypeScore: 70, // Default hype score
-        xMentions: 500 // Default X mentions
+        hypeScore: 70,
+        xMentions: 500
       };
-      
-      // Store in Redis for future queries
       await redis.hset(`allTokens:${token.address}`, token);
-      
       return res.json(token);
     }
     
-    // If not found anywhere
     res.json({
       name: "Not Found",
       address: q,
@@ -333,19 +275,13 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
-// Health check endpoint
 app.get("/", (req, res) => {
   res.json({ status: "HypeScreener API is running" });
 });
 
-// Start the server
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}`);
-  
-  // Load initial tokens
   loadInitialTokens();
-  
-  // Connect to Helius WebSocket
   connectToHelius();
 });
